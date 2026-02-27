@@ -117,15 +117,14 @@ def register_ipython_magics():
     kernel.line_magics["gnuplot"] = magic
     kernel.cell_magics["gnuplot"] = magic
 
-    @register_line_magic
-    def _(line):
+    @register_line_magic("gnuplot")
+    def _gnuplot_line(line):
         magic.line_gnuplot(line)
 
-    @register_cell_magic
-    def _(line, cell):
+    @register_cell_magic("gnuplot")
+    def _gnuplot_cell(line, cell):
         magic.code = cell
         magic.cell_gnuplot()
-
 
 def _parse_args(args):
     """

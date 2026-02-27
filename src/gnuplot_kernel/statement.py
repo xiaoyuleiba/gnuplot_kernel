@@ -14,16 +14,25 @@ CMD_RE = re.compile(
 )
 
 # plot statements
+# PLOT_RE = re.compile(
+#     r"^\s*"
+#     r"(?P<plot_cmd>"
+#     r"plot|plo|pl|p|"
+#     r"splot|splo|spl|sp|"
+#     r"replot|replo|repl|rep"
+#     r")"
+#     r"\s?"
+# )
 PLOT_RE = re.compile(
     r"^\s*"
-    r"(?P<plot_cmd>"
-    r"plot|plo|pl|p|"
+    r"(?P<cmd>"
+    r"(?:plot|plo|pl|p|"
     r"splot|splo|spl|sp|"
-    r"replot|replo|repl|rep"
+    r"replot|replo|repl|rep)"
     r")"
-    r"\s?"
+    r"\b"
+    r"(?:\s+|$)"
 )
-
 # "set multiplot" and abbreviated variants
 SET_MULTIPLE_RE = re.compile(
     r"\s*"

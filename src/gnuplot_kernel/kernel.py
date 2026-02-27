@@ -1,5 +1,9 @@
 from __future__ import annotations
-
+import os
+import time
+from IPython.display import Image, SVG
+import re
+import tempfile
 import contextlib
 import sys
 import uuid
@@ -24,7 +28,34 @@ class GnuplotKernel(ProcessMetaKernel):
     """
     GnuplotKernel
     """
+ 
+    @staticmethod
+    def _wait_nonzero(path, timeout=5.0, poll=0.05):
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            try:
+                if path.stat().st_size > 0:
+                    return True
+            except FileNotFoundError:
+                pass
+            time.sleep(poll)
+        return False
 
+    @staticmethod
+    def _read_bytes_retry(path, timeout=5.0, poll=0.05):
+        t0 = time.time()
+        last_exc = None
+        while time.time() - t0 < timeout:
+            try:
+                data = path.read_bytes()
+                if data:
+                    return data
+            except (PermissionError, OSError) as e:
+                last_exc = e
+            time.sleep(poll)
+        if last_exc:
+            raise last_exc
+        return b""
     implementation = "Gnuplot Kernel"
     implementation_version = get_version("gnuplot_kernel")
     language = "gnuplot"
@@ -59,18 +90,24 @@ class GnuplotKernel(ProcessMetaKernel):
     wrapper: GnuplotREPLWrapper
     _bad_prompts: set = set()
 
-    def check_prompt(self):
-        """
-        Print warning if the prompt looks bad
+    # def check_prompt(self):
+    #     """
+    #     Print warning if the prompt looks bad
 
-        A bad prompt is one that does not contain the string 'gnuplot>'.
-        The warning is printed once per bad prompt.
-        """
+    #     A bad prompt is one that does not contain the string 'gnuplot>'.
+    #     The warning is printed once per bad prompt.
+    #     """
+    #     prompt = cast("str", self.wrapper.prompt)
+    #     if "gnuplot>" not in prompt and prompt not in self._bad_prompts:
+    #         print(f"Warning: The prompt is currently set to '{prompt}'")
+    #         self._bad_prompts.add(prompt)
+    def check_prompt(self):
         prompt = cast("str", self.wrapper.prompt)
+        if prompt == "__GPK_READY__":
+            return
         if "gnuplot>" not in prompt and prompt not in self._bad_prompts:
             print(f"Warning: The prompt is currently set to '{prompt}'")
             self._bad_prompts.add(prompt)
-
     def do_execute_direct(self, code, silent=False):
         # We wrap the real function so that gnuplot_kernel can
         # give a message when an exception occurs. Without
@@ -160,22 +197,30 @@ class GnuplotKernel(ProcessMetaKernel):
         code = "\n".join(lines)
         return code
 
-    def get_image_filename(self):
-        """
-        Create file to which gnuplot will write the plot
+    # def get_image_filename(self):
+    #     """
+    #     Create file to which gnuplot will write the plot
 
-        Returns the filename.
-        """
-        # we could use tempfile.NamedTemporaryFile but we do not
-        # want to create the file, gnuplot will create it.
-        # Later on when we check if the file exists we know
-        # whodunnit.
+    #     Returns the filename.
+    #     """
+    #     # we could use tempfile.NamedTemporaryFile but we do not
+    #     # want to create the file, gnuplot will create it.
+    #     # Later on when we check if the file exists we know
+    #     # whodunnit.
+    #     fmt = self.plot_settings["format"]
+    #     filename = Path(
+    #         f"/tmp/gnuplot-inline-{uuid.uuid1()}.{IMG_COUNTER_FMT}.{fmt}"
+    #     )
+    #     self._image_files.append(filename)
+    #     return filename
+    def get_image_filename(self):
         fmt = self.plot_settings["format"]
-        filename = Path(
-            f"/tmp/gnuplot-inline-{uuid.uuid1()}.{IMG_COUNTER_FMT}.{fmt}"
-        )
+        tmpdir = Path(tempfile.gettempdir())
+        filename = tmpdir / f"gnuplot-inline-{uuid.uuid1()}.{IMG_COUNTER_FMT}.{fmt}"
+        # print(filename)
         self._image_files.append(filename)
-        return filename
+        return filename.as_posix()
+    
 
     def iter_image_files(self):
         """
@@ -189,17 +234,52 @@ class GnuplotKernel(ProcessMetaKernel):
         )
         return it
 
+    # def display_images(self):
+    #     """
+    #     Display images if gnuplot wrote to them
+    #     """
+    #     settings = self.plot_settings
+    #     if self.inline_plotting:
+    #         _Image = SVG if settings["format"] == "svg" else Image
+    #     else:
+    #         return
+
+    #     for filename in self.iter_image_files():
+    #         try:
+    #             size = filename.stat().st_size
+    #         except FileNotFoundError:
+    #             size = 0
+
+    #         if not size:
+    #             msg = (
+    #                 "Failed to read and display image file from gnuplot."
+    #                 "Possibly:\n"
+    #                 "1. You have plotted to a non interactive terminal.\n"
+    #                 "2. You have an invalid expression."
+    #             )
+    #             print(msg)
+    #             continue
+
+    #         im = _Image(str(filename))
+    #         self.Display(im)
+
+
+
+
     def display_images(self):
-        """
-        Display images if gnuplot wrote to them
-        """
         settings = self.plot_settings
-        if self.inline_plotting:
-            _Image = SVG if settings["format"] == "svg" else Image
-        else:
+        if not self.inline_plotting:
             return
 
+        fmt = str(settings.get("format", "png")).lower().lstrip(".")
+        if fmt == "jpg":
+            fmt = "jpeg"
+
         for filename in self.iter_image_files():
+            
+            if os.name == "nt":
+                self._wait_nonzero(filename, timeout=10.0, poll=0.05)
+
             try:
                 size = filename.stat().st_size
             except FileNotFoundError:
@@ -207,16 +287,19 @@ class GnuplotKernel(ProcessMetaKernel):
 
             if not size:
                 msg = (
-                    "Failed to read and display image file from gnuplot."
-                    "Possibly:\n"
+                    "Failed to read and display image file from gnuplot.Possibly:\n"
                     "1. You have plotted to a non interactive terminal.\n"
                     "2. You have an invalid expression."
                 )
                 print(msg)
                 continue
 
-            im = _Image(str(filename))
-            self.Display(im)
+            if fmt == "svg":
+                data = filename.read_text(encoding="utf-8", errors="replace")
+                self.Display(SVG(data=data))
+            else:
+                data = self._read_bytes_retry(filename, timeout=10.0, poll=0.05)
+                self.Display(Image(data=data, format=fmt))
 
     def delete_image_files(self):
         """
@@ -230,10 +313,33 @@ class GnuplotKernel(ProcessMetaKernel):
 
         self._image_files = []
 
+    # def makeWrapper(self):
+    #     """
+    #     Start gnuplot and return wrapper around the REPL
+    #     """
+    #     if pexpect.which("gnuplot"):
+    #         program = "gnuplot"
+    #     elif pexpect.which("gnuplot.exe"):
+    #         program = "gnuplot.exe"
+    #     else:
+    #         raise Exception("gnuplot not found.")
+
+    #     # We don't want help commands getting stuck,
+    #     # use a non interactive PAGER
+    #     if pexpect.which("env") and pexpect.which("cat"):
+    #         command = "env PAGER=cat {}".format(program)
+    #     else:
+    #         command = program
+
+    #     wrapper = GnuplotREPLWrapper(
+    #         cmd_or_spawn=command,
+    #         prompt_regex=PROMPT_RE,
+    #         prompt_change_cmd=None,
+    #     )
+    #     # No sleeping before sending commands to gnuplot
+    #     wrapper.child.delaybeforesend = 0
+    #     return wrapper
     def makeWrapper(self):
-        """
-        Start gnuplot and return wrapper around the REPL
-        """
         if pexpect.which("gnuplot"):
             program = "gnuplot"
         elif pexpect.which("gnuplot.exe"):
@@ -241,22 +347,29 @@ class GnuplotKernel(ProcessMetaKernel):
         else:
             raise Exception("gnuplot not found.")
 
-        # We don't want help commands getting stuck,
-        # use a non interactive PAGER
         if pexpect.which("env") and pexpect.which("cat"):
             command = "env PAGER=cat {}".format(program)
         else:
             command = program
 
-        wrapper = GnuplotREPLWrapper(
-            cmd_or_spawn=command,
-            prompt_regex=PROMPT_RE,
-            prompt_change_cmd=None,
-        )
-        # No sleeping before sending commands to gnuplot
+        if os.name == "nt":
+            READY = "__GPK_READY__"
+            wrapper = GnuplotREPLWrapper(
+                cmd_or_spawn=command,
+                prompt_regex=re.compile(re.escape(READY)),
+                prompt_change_cmd=None,
+                continuation_prompt_regex=re.compile(r"(?!)"),
+                prompt_emit_cmd=f'print "{READY}"',
+            )
+        else:
+            wrapper = GnuplotREPLWrapper(
+                cmd_or_spawn=command,
+                prompt_regex=PROMPT_RE,
+                prompt_change_cmd=None,
+            )
+
         wrapper.child.delaybeforesend = 0
         return wrapper
-
     def do_shutdown(self, restart):
         """
         Exit the gnuplot process and any other underlying stuff
@@ -280,25 +393,79 @@ class GnuplotKernel(ProcessMetaKernel):
         cmd = f"{IMG_COUNTER}=0"
         self.do_execute_direct(cmd)
 
-    def handle_plot_settings(self):
-        """
-        Handle the current plot settings
+    # def handle_plot_settings(self):
+    #     """
+    #     Handle the current plot settings
 
-        This is used by the gnuplot line magic. The plot magic
-        is innadequate.
-        """
+    #     This is used by the gnuplot line magic. The plot magic
+    #     is innadequate.
+    #     """
+    #     settings = self.plot_settings
+    #     if "termspec" not in settings or not settings["termspec"]:
+    #         settings["termspec"] = 'pngcairo size 385, 256 font "Arial,10"'
+    #     if "format" not in settings or not settings["format"]:
+    #         settings["format"] = "png"
+
+    #     self.inline_plotting = settings["backend"] == "inline"
+
+    #     cmd = "set terminal {}".format(settings["termspec"])
+    #     self.do_execute_direct(cmd)
+    #     self.reset_image_counter()
+    # def handle_plot_settings(self):
+    #     settings = self.plot_settings
+
+    #     if "termspec" not in settings or not settings["termspec"]:
+    #         if os.name == "nt":
+    #             settings["termspec"] = 'png size 385, 256'
+    #         else:
+    #             settings["termspec"] = 'pngcairo size 385, 256 font "Arial,10"'
+
+    #     if "format" not in settings or not settings["format"]:
+    #         settings["format"] = "png"
+
+    #     self.inline_plotting = settings["backend"] == "inline"
+    #     cmd = "set terminal {}".format(settings["termspec"])
+    #     self.do_execute_direct(cmd)
+    #     self.reset_image_counter()
+
+    
+
+    def handle_plot_settings(self):
         settings = self.plot_settings
-        if "termspec" not in settings or not settings["termspec"]:
-            settings["termspec"] = 'pngcairo size 385, 256 font "Arial,10"'
+
         if "format" not in settings or not settings["format"]:
             settings["format"] = "png"
 
-        self.inline_plotting = settings["backend"] == "inline"
+        fmt = str(settings["format"]).lower().lstrip(".")
+        if fmt == "jpg":
+            fmt_for_term = "jpeg"
+        else:
+            fmt_for_term = fmt
 
+        if "termspec" not in settings or not settings["termspec"]:
+            if os.name == "nt":
+                if fmt_for_term == "png":
+                    settings["termspec"] = "png size 385, 256"
+                elif fmt_for_term == "jpeg":
+                    settings["termspec"] = "jpeg size 385, 256"
+                elif fmt_for_term == "svg":
+                    settings["termspec"] = "svg size 385, 256"
+                else:
+                    settings["termspec"] = "png size 385, 256"
+            else:
+                if fmt_for_term == "png":
+                    settings["termspec"] = 'pngcairo size 385, 256 font "Arial,10"'
+                elif fmt_for_term == "jpeg":
+                    settings["termspec"] = 'jpeg size 385, 256'
+                elif fmt_for_term == "svg":
+                    settings["termspec"] = 'svg size 385, 256'
+                else:
+                    settings["termspec"] = 'pngcairo size 385, 256 font "Arial,10"'
+
+        self.inline_plotting = settings["backend"] == "inline"
         cmd = "set terminal {}".format(settings["termspec"])
         self.do_execute_direct(cmd)
         self.reset_image_counter()
-
 
 class StateMachine:
     """

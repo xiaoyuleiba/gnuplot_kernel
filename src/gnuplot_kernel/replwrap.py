@@ -83,7 +83,7 @@ class GnuplotREPLWrapper(REPLWrapper):
         return code
 
     def send(self, cmd):
-        self.child.send(cmd + "\r")
+        self.child.send(cmd + CRLF) 
 
     def _force_prompt(self, timeout: float = 30, n=4):
         """
@@ -235,7 +235,9 @@ class GnuplotREPLWrapper(REPLWrapper):
 
             # Removing any crlfs makes subsequent
             # processing cleaner
-            retval = cast("str", self.child.before).replace(CRLF, "\n")
+
+            retval = cast("str", self.child.before).replace(CRLF, "\n") 
+
             self.prompt = self.child.after
             if self.is_error_output(retval):
                 msg = "{}\n{}".format(line, textwrap.dedent(retval))
@@ -243,8 +245,9 @@ class GnuplotREPLWrapper(REPLWrapper):
 
             # Sometimes block stmts like datablocks make the
             # the prompt leak into the return value
-            retval = PROMPT_REMOVE_RE.sub("", retval).strip(" ")
 
+            # retval = PROMPT_REMOVE_RE.sub("", retval).strip(" ")
+            retval = PROMPT_REMOVE_RE.sub("", retval).strip()
             # Some gnuplot installations return the input statements
             # We do not count those as output
             if retval.strip() != line.strip():
