@@ -9,8 +9,7 @@ import sys
 import uuid
 from itertools import chain
 from pathlib import Path
-from typing import cast
-
+from typing import cast, Iterable 
 from IPython.display import SVG, Image
 from metakernel import MetaKernel, ProcessMetaKernel, pexpect
 from metakernel.process_metakernel import TextOutput
@@ -28,9 +27,11 @@ class GnuplotKernel(ProcessMetaKernel):
     """
     GnuplotKernel
     """
- 
+    _pending_unlink: list[Path] = []
+
+
     @staticmethod
-    def _wait_nonzero(path, timeout=5.0, poll=0.05):
+    def _wait_nonzero(path, timeout=5.0, poll=0.01):
         t0 = time.time()
         while time.time() - t0 < timeout:
             try:
@@ -41,8 +42,112 @@ class GnuplotKernel(ProcessMetaKernel):
             time.sleep(poll)
         return False
 
+
+
     @staticmethod
-    def _read_bytes_retry(path, timeout=5.0, poll=0.05):
+    def _wait_size_stable(path: Path, timeout=20.0, poll=0.02, stable_rounds=5) -> int:
+        """
+        Wait until file size stops changing for `stable_rounds` consecutive polls.
+        Returns the last observed size (may be 0 if timeout).
+        """
+        t0 = time.time()
+        last = -1
+        stable = 0
+        last_size = 0
+        while time.time() - t0 < timeout:
+            try:
+                sz = path.stat().st_size
+            except FileNotFoundError:
+                sz = 0
+
+            last_size = sz
+            if sz > 0 and sz == last:
+                stable += 1
+                if stable >= stable_rounds:
+                    return sz
+            else:
+                stable = 0
+                last = sz
+
+            time.sleep(poll)
+        return last_size
+
+    @staticmethod
+    def _read_complete_bytes_retry(path: Path, timeout=20.0, poll=0.01) -> bytes:
+        """
+        Windows 上大图写入时，文件可能：
+          - 被写端独占锁住（read 会 PermissionError/WinError 32）
+          - size 非零但仍在增长（读到截断内容）
+        这里用“读前 size == 读后 size 且 len(data) == size”作为完成判据。
+        """
+        t0 = time.time()
+        last_exc: Exception | None = None
+        delay = poll
+        while time.time() - t0 < timeout:
+            # try:
+            #     target = path.stat().st_size
+            # except FileNotFoundError:
+            #     target = 0
+
+            # if target <= 0:
+            try:
+                before = path.stat().st_size
+            except FileNotFoundError:
+                before = 0
+
+            if before <= 0:
+                time.sleep(poll)
+                continue
+
+            try:
+                data = path.read_bytes()
+                # 若仍在写入，常见现象是 len(data) < target
+                # if len(data) == target:
+                #     # 再确认一次 size 没继续变大（避免 race）
+                #     stable = GnuplotKernel._wait_size_stable(path, timeout=timeout, poll=poll)
+                #     if stable == len(data):
+                #         return data
+
+                try:
+                    after = path.stat().st_size
+                except FileNotFoundError:
+                    after = 0
+
+                # 写入完成且未增长，才认为完整
+                if after == before and len(data) == after:
+                    return data
+                
+            except (PermissionError, OSError) as e:
+                last_exc = e
+
+            # time.sleep(poll)
+            time.sleep(delay)
+            # 指数退避，上限 50ms
+            delay = min(delay * 1.6, 0.02)
+ 
+
+        if last_exc:
+            raise last_exc
+        return b""
+
+
+
+
+    
+
+
+
+
+
+
+
+
+
+
+
+
+    @staticmethod
+    def _read_bytes_retry(path, timeout=5.0, poll=0.02):
         t0 = time.time()
         last_exc = None
         while time.time() - t0 < timeout:
@@ -56,6 +161,16 @@ class GnuplotKernel(ProcessMetaKernel):
         if last_exc:
             raise last_exc
         return b""
+    
+
+
+
+
+
+
+
+
+
     implementation = "Gnuplot Kernel"
     implementation_version = get_version("gnuplot_kernel")
     language = "gnuplot"
@@ -101,6 +216,62 @@ class GnuplotKernel(ProcessMetaKernel):
     #     if "gnuplot>" not in prompt and prompt not in self._bad_prompts:
     #         print(f"Warning: The prompt is currently set to '{prompt}'")
     #         self._bad_prompts.add(prompt)
+
+
+    def _iter_inline_candidates(self) -> list[Path]:
+        """
+        Return inline image files currently present (sorted).
+        The existing code likely already has iter_image_files(); this helper is
+        only for the quiescence wait to repeatedly sample the directory.
+        """
+        return list(self.iter_image_files())
+
+    def _wait_inline_quiescence(
+            self,
+        timeout: float = 2.0,
+        poll: float = 0.01,
+        settle: float = 0.08,
+    ) -> None:
+        """
+        Wait until inline output files stop appearing/changing.
+        We treat the output as 'ready' when:
+          - number of candidate files stops increasing, AND
+          - newest mtime stops changing for `settle` seconds.
+        This prevents missing plots in a single cell with multiple `plot` lines,
+        especially when notebook 'Run All' removes inter-cell idle gaps.
+        """
+        t0 = time.time()
+        last_count = -1
+        last_newest_mtime = -1.0
+        stable_since = None  # type: float | None
+
+        while time.time() - t0 < timeout:
+            files = self._iter_inline_candidates()
+            count = len(files)
+            newest_mtime = -1.0
+            if files:
+                # newest mtime among candidates
+                try:
+                    newest_mtime = max(p.stat().st_mtime for p in files)
+                except FileNotFoundError:
+                    newest_mtime = -1.0
+
+            changed = (count != last_count) or (newest_mtime != last_newest_mtime)
+
+            if changed:
+                last_count = count
+                last_newest_mtime = newest_mtime
+                stable_since = None
+            else:
+                if stable_since is None:
+                    stable_since = time.time()
+                elif time.time() - stable_since >= settle:
+                    return
+
+            time.sleep(poll)
+
+
+
     def check_prompt(self):
         prompt = cast("str", self.wrapper.prompt)
         if prompt == "__GPK_READY__":
@@ -267,6 +438,35 @@ class GnuplotKernel(ProcessMetaKernel):
 
 
     def display_images(self):
+        # Key fix: do not start reading before gnuplot finishes emitting
+        # all images for this cell.
+        if os.name == "nt" and self.inline_plotting:  
+            files0 = self._iter_inline_candidates()
+            max_sz = 0
+            for p in files0:
+                try:
+                    max_sz = max(max_sz, p.stat().st_size)
+                except FileNotFoundError:
+                    pass
+            if max_sz >= 10_000_000:
+                self._wait_inline_quiescence(timeout=8.0, poll=0.02, settle=0.18)
+            else:
+                self._wait_inline_quiescence(timeout=2.0, poll=0.01, settle=0.08)
+
+
+                # 非阻塞清理上一轮未删掉的文件
+        if os.name == "nt" and self._pending_unlink:
+            keep: list[Path] = []
+            for p in self._pending_unlink:
+                try:
+                    p.unlink()
+                except (FileNotFoundError, PermissionError):
+                    keep.append(p)
+            self._pending_unlink = keep
+
+
+
+
         settings = self.plot_settings
         if not self.inline_plotting:
             return
@@ -277,8 +477,14 @@ class GnuplotKernel(ProcessMetaKernel):
 
         for filename in self.iter_image_files():
             
+            # if os.name == "nt":
+            #     self._wait_nonzero(filename, timeout=10.0, poll=0.02)
+
             if os.name == "nt":
-                self._wait_nonzero(filename, timeout=10.0, poll=0.05)
+                # 大图：等 size 稳定，而不是只等到“非零”
+                self._wait_size_stable(filename, timeout=10.0, poll=0.02, stable_rounds=5)
+
+
 
             try:
                 size = filename.stat().st_size
@@ -294,12 +500,54 @@ class GnuplotKernel(ProcessMetaKernel):
                 print(msg)
                 continue
 
-            if fmt == "svg":
-                data = filename.read_text(encoding="utf-8", errors="replace")
-                self.Display(SVG(data=data))
-            else:
-                data = self._read_bytes_retry(filename, timeout=10.0, poll=0.05)
-                self.Display(Image(data=data, format=fmt))
+
+
+
+
+            # if fmt == "svg":
+            #     data = filename.read_text(encoding="utf-8", errors="replace")
+            #     self.Display(SVG(data=data))
+ 
+            # else:
+            #     data = self._read_bytes_retry(filename, timeout=10.0, poll=0.02)
+            #     self.Display(Image(data=data, format=fmt))
+
+            try:
+                if fmt == "svg":
+                    data = filename.read_text(encoding="utf-8", errors="replace")
+                    self.Display(SVG(data=data))
+                else:
+                    # 关键：读“完整文件”，避免截断 + WinError 32 直接冒泡
+                    if os.name == "nt":
+                        # data = self._read_complete_bytes_retry(filename, timeout=10.0, poll=0.01)
+                        # data = self._read_complete_bytes_retry(filename, timeout=30.0, poll=0.02)
+
+
+                                                # 自适应：文件越大，允许更久的写入完成时间
+                        try:
+                            sz0 = filename.stat().st_size
+                        except FileNotFoundError:
+                            sz0 = 0
+                        if sz0 >= 20_000_000:       # 约 20MB，典型大图
+                            timeout, poll = 20.0, 0.02
+                        elif sz0 >= 2_000_000:      # 中等
+                            timeout, poll = 8.0, 0.01
+                        else:                        # 小图
+                            timeout, poll = 2.0, 0.005
+                        data = self._read_complete_bytes_retry(filename, timeout=timeout, poll=poll)
+
+
+
+                    else:
+                        data = self._read_bytes_retry(filename, timeout=10.0, poll=0.02)
+                    self.Display(Image(data=data, format=fmt))
+            except (PermissionError, OSError) as e:
+                # 不把异常抛到 do_execute_direct 外层，避免额外的 “Error: ...” 输出
+                print(f"Error: {e}")
+                continue
+
+
+
 
     def delete_image_files(self):
         """
@@ -308,8 +556,34 @@ class GnuplotKernel(ProcessMetaKernel):
         # After display_images(), the real images are
         # no longer required.
         for filename in self.iter_image_files():
-            with contextlib.suppress(FileNotFoundError):
-                filename.unlink()
+            # with contextlib.suppress(FileNotFoundError):
+            #     filename.unlink()
+             
+            if os.name == "nt":
+                # t0 = time.time()
+                # while True:
+                #     try:
+                #         filename.unlink()
+                #         break
+                #     except FileNotFoundError:
+                #         break
+                #     except PermissionError:
+                #         if time.time() - t0 > 2.0:
+                #             break
+                #         time.sleep(0.02)
+
+
+
+
+                try:
+                    filename.unlink()
+                except (FileNotFoundError, PermissionError):
+                    self._pending_unlink.append(filename)
+
+
+            else:
+                with contextlib.suppress(FileNotFoundError):
+                    filename.unlink()
 
         self._image_files = []
 
