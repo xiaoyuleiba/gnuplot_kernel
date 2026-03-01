@@ -21,7 +21,8 @@ from .utils import get_version
 
 IMG_COUNTER = "__gpk_img_index"
 IMG_COUNTER_FMT = "%03d"
-
+_TERMSPEC_SIZE_RE = re.compile(r"\bsize\s+(\d+)\s*,\s*(\d+)\b", re.IGNORECASE)
+_SPLOT_CMD_RE = re.compile(r"^\s*(?:splot|splo|spl|sp)\b", re.IGNORECASE)
 
 class GnuplotKernel(ProcessMetaKernel):
     """
@@ -42,7 +43,61 @@ class GnuplotKernel(ProcessMetaKernel):
             time.sleep(poll)
         return False
 
+    @staticmethod
+    def _termspec_with_min_size(termspec: str, min_w: int, min_h: int) -> str:
+        """
+        若 termspec 未指定 size，则插入 size min_w,min_h
+        若指定了 size 但小于下限，则提升到下限
+        其它情况保持不变
+        """
+        m = _TERMSPEC_SIZE_RE.search(termspec)
+        if m:
+            w, h = int(m.group(1)), int(m.group(2))
+            if w >= min_w and h >= min_h:
+                return termspec
+            return _TERMSPEC_SIZE_RE.sub(f"size {min_w}, {min_h}", termspec, count=1)
 
+        parts = termspec.strip().split(None, 1)
+        if not parts:
+            return termspec
+        term = parts[0]
+        rest = parts[1] if len(parts) > 1 else ""
+        return f"{term} size {min_w}, {min_h}" + (f" {rest}" if rest else "")
+
+
+
+    @staticmethod
+    def _looks_complete_bytes(data: bytes, fmt: str) -> bool:
+        fmt = str(fmt).lower().lstrip(".")
+        if fmt == "jpg":
+            fmt = "jpeg"
+
+        # JPEG: SOI + (last EOI close to end)
+        if fmt == "jpeg":
+            if not data.startswith(b"\xff\xd8"):
+                return False
+            i = data.rfind(b"\xff\xd9")
+            return i != -1 and i >= max(0, len(data) - 64)
+
+        # PNG: signature + IEND close to end
+        if fmt == "png":
+            if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+                return False
+            return data.rfind(b"IEND") >= max(0, len(data) - 64)
+
+        # GIF: trailer 0x3B
+        if fmt == "gif":
+            if not (data.startswith(b"GIF87a") or data.startswith(b"GIF89a")):
+                return False
+            return data.endswith(b"\x3b")
+
+        # PDF: %%EOF near end
+        if fmt == "pdf":
+            tail = data[-2048:] if len(data) > 2048 else data
+            return b"%%EOF" in tail
+
+        # other formats: keep original behavior
+        return True
 
     @staticmethod
     def _wait_size_stable(path: Path, timeout=20.0, poll=0.02, stable_rounds=5) -> int:
@@ -72,24 +127,145 @@ class GnuplotKernel(ProcessMetaKernel):
             time.sleep(poll)
         return last_size
 
+
+
+    # @staticmethod
+    # def _looks_complete_bytes(data: bytes, fmt: str) -> bool:
+    #     fmt = str(fmt).lower().lstrip(".")
+    #     if fmt == "jpg":
+    #         fmt = "jpeg"
+
+    #     if fmt == "jpeg":
+    #         # SOI 0xFFD8 ... EOI 0xFFD9（EOI 应出现在末尾附近）
+    #         if len(data) < 4:
+    #             return False
+    #         if not data.startswith(b"\xff\xd8"):
+    #             return False
+    #         i = data.rfind(b"\xff\xd9")
+    #         return i != -1 and i >= max(0, len(data) - 64)
+
+    #     if fmt == "png":
+    #         if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+    #             return False
+    #         return data.rfind(b"IEND") >= max(0, len(data) - 64)
+
+    #     if fmt == "gif":
+    #         if not (data.startswith(b"GIF87a") or data.startswith(b"GIF89a")):
+    #             return False
+    #         return data.endswith(b"\x3b")
+
+    #     if fmt == "pdf":
+    #         tail = data[-2048:] if len(data) > 2048 else data
+    #         return b"%%EOF" in tail
+
+    #     return True
+
+
+
+
+
+
+    # @staticmethod
+    # def _read_complete_bytes_retry(
+    #     path: Path, 
+    #     fmt: str | None = None,
+    #     timeout: float = 20.0,
+    #     poll: float = 0.01,
+    # ) -> bytes:
+    #     """
+    #     Windows 上大图写入时，文件可能：
+    #       - 被写端独占锁住（read 会 PermissionError/WinError 32）
+    #       - size 非零但仍在增长（读到截断内容）
+    #     这里用“读前 size == 读后 size 且 len(data) == size”作为完成判据。
+    #     """
+    #     t0 = time.time()
+    #     last_exc: Exception | None = None
+    #     delay = poll
+    #     while time.time() - t0 < timeout:
+    #         # try:
+    #         #     target = path.stat().st_size
+    #         # except FileNotFoundError:
+    #         #     target = 0
+
+    #         # if target <= 0:
+    #         try:
+    #             before = path.stat().st_size
+    #         except FileNotFoundError:
+    #             before = 0
+
+    #         if before <= 0:
+    #             time.sleep(poll)
+    #             continue
+
+    #         try:
+    #             data = path.read_bytes()
+    #             # 若仍在写入，常见现象是 len(data) < target
+    #             # if len(data) == target:
+    #             #     # 再确认一次 size 没继续变大（避免 race）
+    #             #     stable = GnuplotKernel._wait_size_stable(path, timeout=timeout, poll=poll)
+    #             #     if stable == len(data):
+    #             #         return data
+
+    #             try:
+    #                 after = path.stat().st_size
+    #             except FileNotFoundError:
+    #                 after = 0
+
+    #             # 写入完成且未增长，才认为完整
+    #             if after == before and len(data) == after:
+    #                 if fmt and not GnuplotKernel._looks_complete_bytes(data, fmt):
+    #                     time.sleep(poll)
+    #                     continue
+
+    #                 # 再短暂确认一次 size 不会在“读完后”继续增长
+    #                 stable = GnuplotKernel._wait_size_stable(
+    #                         path,
+    #                     timeout=min(0.6, timeout),
+    #                     poll=poll,
+    #                     stable_rounds=5,
+    #                 )
+    #                 if stable != after:
+    #                     time.sleep(poll)
+    #                     continue
+
+    #                 return data
+                
+    #         except (PermissionError, OSError) as e:
+    #             last_exc = e
+
+    #         # time.sleep(poll)
+    #         time.sleep(delay)
+    #         # 指数退避，上限 50ms
+    #         delay = min(delay * 1.6, 0.02)
+ 
+
+    #     if last_exc:
+    #         raise last_exc
+    #     return b""
+
+
+
     @staticmethod
-    def _read_complete_bytes_retry(path: Path, timeout=20.0, poll=0.01) -> bytes:
+    def _read_complete_bytes_retry(
+        path: Path,
+        fmt: str | None = None,
+        timeout: float = 20.0,
+        poll: float = 0.01,
+    ) -> bytes:
         """
         Windows 上大图写入时，文件可能：
-          - 被写端独占锁住（read 会 PermissionError/WinError 32）
-          - size 非零但仍在增长（读到截断内容）
-        这里用“读前 size == 读后 size 且 len(data) == size”作为完成判据。
+        1) 被写端独占锁住（read 会 PermissionError/WinError 32）
+        2) size 非零但仍在增长（读到截断内容）
+        完成判据：
+        1) 读前 size == 读后 size 且 len(data) == size
+        2) 若提供 fmt，则满足对应格式的“完整性判据”（jpeg 要有 EOI）
+        3) 读完后再确认一次 size 确实稳定（短暂等待）
         """
         t0 = time.time()
         last_exc: Exception | None = None
         delay = poll
-        while time.time() - t0 < timeout:
-            # try:
-            #     target = path.stat().st_size
-            # except FileNotFoundError:
-            #     target = 0
 
-            # if target <= 0:
+        while time.time() - t0 < timeout:
             try:
                 before = path.stat().st_size
             except FileNotFoundError:
@@ -101,39 +277,39 @@ class GnuplotKernel(ProcessMetaKernel):
 
             try:
                 data = path.read_bytes()
-                # 若仍在写入，常见现象是 len(data) < target
-                # if len(data) == target:
-                #     # 再确认一次 size 没继续变大（避免 race）
-                #     stable = GnuplotKernel._wait_size_stable(path, timeout=timeout, poll=poll)
-                #     if stable == len(data):
-                #         return data
 
                 try:
                     after = path.stat().st_size
                 except FileNotFoundError:
                     after = 0
 
-                # 写入完成且未增长，才认为完整
                 if after == before and len(data) == after:
+                    if fmt and not GnuplotKernel._looks_complete_bytes(data, fmt):
+                        time.sleep(poll)
+                        continue
+
+                    stable = GnuplotKernel._wait_size_stable(
+                        path,
+                        timeout=min(0.6, timeout),
+                        poll=poll,
+                        stable_rounds=5,
+                    )
+                    if stable != after:
+                        time.sleep(poll)
+                        continue
+
                     return data
-                
+
             except (PermissionError, OSError) as e:
                 last_exc = e
 
-            # time.sleep(poll)
             time.sleep(delay)
-            # 指数退避，上限 50ms
             delay = min(delay * 1.6, 0.02)
- 
 
         if last_exc:
             raise last_exc
         return b""
-
-
-
-
-    
+        
 
 
 
@@ -330,7 +506,40 @@ class GnuplotKernel(ProcessMetaKernel):
 
         # "set output sprintf('foobar.%d.png', counter);"
         # "counter=counter+1"
-        def set_output_inline(lines):
+
+
+        settings = self.plot_settings
+        base_termspec = str(settings.get("termspec", "")).strip()
+        fmt = str(settings.get("format", "png")).lower().lstrip(".")
+        if fmt == "jpg":
+            fmt = "jpeg"
+
+        restore_termspec_pending = False
+
+        def maybe_restore_terminal(lines):
+            nonlocal restore_termspec_pending
+            if restore_termspec_pending and base_termspec:
+                lines.append(f"set terminal {base_termspec}")
+            restore_termspec_pending = False
+
+        def set_output_inline(lines, stmt):
+            nonlocal restore_termspec_pending
+            # 若上一幅图临时改过 terminal，这里先恢复，确保不影响后续 plot
+            maybe_restore_terminal(lines)
+
+            # splot 临时放大画布，避免内容被裁掉
+            # 只对常见 inline 位图格式启用，且仅当 base_termspec 存在
+            if base_termspec and fmt in ("jpeg", "png", "svg"):
+                if _SPLOT_CMD_RE.match(str(stmt)):
+                    big_termspec = self._termspec_with_min_size(base_termspec, 1024, 768)
+                    if big_termspec != base_termspec:
+                        lines.append(f"set terminal {big_termspec}")
+                        restore_termspec_pending = True
+        # def set_output_inline(lines):
+
+
+
+
             tpl = self.get_image_filename()
             if tpl:
                 cmd = (
@@ -357,7 +566,7 @@ class GnuplotKernel(ProcessMetaKernel):
                 and not is_joined_stmt
             )
             if add_inline_plot:
-                set_output_inline(lines)
+                set_output_inline(lines, stmt)
 
             lines.append(stmt)
             is_joined_stmt = stmt.strip().endswith("\\")
@@ -365,6 +574,12 @@ class GnuplotKernel(ProcessMetaKernel):
         # Make gnuplot flush the output
         if not lines[-1].endswith("\\"):
             lines.append("unset output")
+        # 若最后一幅图是 splot 并临时改过 terminal，这里恢复
+        if restore_termspec_pending and base_termspec:
+            lines.append(f"set terminal {base_termspec}")
+
+
+
         code = "\n".join(lines)
         return code
 
@@ -534,7 +749,8 @@ class GnuplotKernel(ProcessMetaKernel):
                             timeout, poll = 8.0, 0.01
                         else:                        # 小图
                             timeout, poll = 2.0, 0.005
-                        data = self._read_complete_bytes_retry(filename, timeout=timeout, poll=poll)
+                        # data = self._read_complete_bytes_retry(filename, timeout=timeout, poll=poll)
+                        data = self._read_complete_bytes_retry(filename, fmt=fmt, timeout=timeout, poll=poll)
 
 
 
@@ -685,61 +901,79 @@ class GnuplotKernel(ProcessMetaKernel):
     #     cmd = "set terminal {}".format(settings["termspec"])
     #     self.do_execute_direct(cmd)
     #     self.reset_image_counter()
-    # def handle_plot_settings(self):
+
+
+
+    def handle_plot_settings(self):
+        settings = self.plot_settings
+
+        if "termspec" not in settings or not settings["termspec"]:
+            if os.name == "nt":
+                settings["termspec"] = 'png size 385, 256'
+            else:
+                settings["termspec"] = 'pngcairo size 385, 256 font "Arial,10"'
+
+        if "format" not in settings or not settings["format"]:
+            settings["format"] = "png"
+
+        self.inline_plotting = settings["backend"] == "inline"
+        cmd = "set terminal {}".format(settings["termspec"])
+        self.do_execute_direct(cmd)
+        self.reset_image_counter()
+ 
+
+
+
+
+    # def handle_plot_settings(self): 
     #     settings = self.plot_settings
-
     #     if "termspec" not in settings or not settings["termspec"]:
-    #         if os.name == "nt":
-    #             settings["termspec"] = 'png size 385, 256'
-    #         else:
-    #             settings["termspec"] = 'pngcairo size 385, 256 font "Arial,10"'
-
+    #         settings["termspec"] = 'pngcairo size 385, 256 font "Arial,10"'
     #     if "format" not in settings or not settings["format"]:
-    #         settings["format"] = "png"
+    #         settings["format"] = "png" 
+    #     # settings = self.plot_settings
+
+    #     # if "format" not in settings or not settings["format"]:
+    #     #     settings["format"] = "png"
+
+    #     # fmt = str(settings["format"]).lower().lstrip(".")
+    #     # if fmt == "jpg":
+    #     #     fmt_for_term = "jpeg"
+    #     # else:
+    #     #     fmt_for_term = fmt
+    #     # if "termspec" not in settings or not settings["termspec"]:
+    #     #     if os.name == "nt":
+    #     #         if fmt_for_term == "png":
+    #     #             settings["termspec"] = "png size 385, 256"
+    #     #         elif fmt_for_term == "jpeg":
+    #     #             settings["termspec"] = "jpeg size 385, 256"
+    #     #         elif fmt_for_term == "svg":
+    #     #             settings["termspec"] = "svg size 385, 256"
+    #     #         else:
+    #     #             settings["termspec"] = "png size 385, 256"
+    #     #     else:
+    #     #         if fmt_for_term == "png":
+    #     #             settings["termspec"] = 'pngcairo size 385, 256 font "Arial,10"'
+    #     #         elif fmt_for_term == "jpeg":
+    #     #             settings["termspec"] = 'jpeg size 385, 256'
+    #     #         elif fmt_for_term == "svg":
+    #     #             settings["termspec"] = 'svg size 385, 256'
+    #     #         else:
+    #     #             settings["termspec"] = 'pngcairo size 385, 256 font "Arial,10"'
 
     #     self.inline_plotting = settings["backend"] == "inline"
     #     cmd = "set terminal {}".format(settings["termspec"])
     #     self.do_execute_direct(cmd)
     #     self.reset_image_counter()
 
-    
 
-    def handle_plot_settings(self):
-        settings = self.plot_settings
 
-        if "format" not in settings or not settings["format"]:
-            settings["format"] = "png"
 
-        fmt = str(settings["format"]).lower().lstrip(".")
-        if fmt == "jpg":
-            fmt_for_term = "jpeg"
-        else:
-            fmt_for_term = fmt
 
-        if "termspec" not in settings or not settings["termspec"]:
-            if os.name == "nt":
-                if fmt_for_term == "png":
-                    settings["termspec"] = "png size 385, 256"
-                elif fmt_for_term == "jpeg":
-                    settings["termspec"] = "jpeg size 385, 256"
-                elif fmt_for_term == "svg":
-                    settings["termspec"] = "svg size 385, 256"
-                else:
-                    settings["termspec"] = "png size 385, 256"
-            else:
-                if fmt_for_term == "png":
-                    settings["termspec"] = 'pngcairo size 385, 256 font "Arial,10"'
-                elif fmt_for_term == "jpeg":
-                    settings["termspec"] = 'jpeg size 385, 256'
-                elif fmt_for_term == "svg":
-                    settings["termspec"] = 'svg size 385, 256'
-                else:
-                    settings["termspec"] = 'pngcairo size 385, 256 font "Arial,10"'
 
-        self.inline_plotting = settings["backend"] == "inline"
-        cmd = "set terminal {}".format(settings["termspec"])
-        self.do_execute_direct(cmd)
-        self.reset_image_counter()
+
+
+
 
 class StateMachine:
     """
